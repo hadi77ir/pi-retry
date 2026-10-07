@@ -371,6 +371,50 @@ export function formatWait(ms: number): string {
   return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
 }
 
+/** Latest assistant message on the journal branch, if the branch ends with one. */
+export interface BranchTailMessage {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Return the branch-tail error, if the journal branch ends with an assistant
+ * error. A newer user/toolResult message (or anything else) means there is
+ * no error tail. Used to catch failures the live transcript no longer shows
+ * (compaction-stripped errors, mid-turn tree navigation).
+ */
+export function branchErrorTail(entries: Array<unknown>): BranchTailMessage | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as { type?: string; message?: BranchTailMessage } | undefined;
+    if (!entry || entry.type !== "message" || !entry.message) continue;
+    if (entry.message.role === "assistant") {
+      return entry.message.stopReason === "error" ? entry.message : undefined;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+function normalizePromptText(text: string): string {
+  const collapsed = text.trim().replace(/\s+/g, " ");
+  return collapsed.length > 4000 ? `${collapsed.slice(0, 4000)}…` : collapsed;
+}
+
+/**
+ * True when the editor holds a request different from the last sent user
+ * turn — e.g. text restored there by tree navigation to a user message
+ * (navigateTree sets leaf=parent and puts the request in the editor, so the
+ * live transcript no longer contains it). Freshly typed follow-ups also match;
+ * sending them on /retry is equivalent to pressing Enter.
+ */
+export function isOrphanedEditorText(editorText: string, lastUserText: string | undefined): boolean {
+  const current = normalizePromptText(editorText);
+  if (!current) return false;
+  if (lastUserText === undefined) return true;
+  return current !== normalizePromptText(lastUserText);
+}
+
 /** Continuation prompts offered when the last turn is a finished assistant message. */
 export const CONTINUATION_PROMPTS = [
   "Continue.",

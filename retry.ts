@@ -36,6 +36,8 @@ import {
   resolveWaitMs,
   formatWait,
   MAX_WAIT_MS,
+  branchErrorTail,
+  isOrphanedEditorText,
   CONTINUATION_PROMPTS,
   CUSTOM_PROMPT_OPTION,
   type ErrorKind,
@@ -112,6 +114,32 @@ function getLiveMessages(): AnyMessage[] | null {
   return state.messages as AnyMessage[];
 }
 
+function readEditorText(ctx: ExtensionCommandContext): string {
+  try {
+    const text = ctx.ui.getEditorText();
+    return typeof text === "string" ? text : "";
+  } catch {
+    // Headless modes have no editor.
+    return "";
+  }
+}
+
+function readBranchEntries(ctx: ExtensionCommandContext): Array<unknown> {
+  try {
+    return ctx.sessionManager.getBranch() as Array<unknown>;
+  } catch {
+    return [];
+  }
+}
+
+function clearEditorText(ctx: ExtensionCommandContext): void {
+  try {
+    ctx.ui.setEditorText("");
+  } catch {
+    // Best-effort: headless modes have no editor.
+  }
+}
+
 function textOf(content: unknown, max = 80): string {
   let text = "";
   if (typeof content === "string") {
@@ -172,23 +200,24 @@ function activeProviderId(ctx: ExtensionCommandContext): string | undefined {
 
 function describeRefusal(kind: ErrorKind, errorMessage: string, detail?: string): string {
   const short = errorMessage.trim().slice(0, 160);
+  const forceHint = ` To force continuation anyway, use '/retry continue'.`;
   if (kind === "quota") {
     return (
       `Not retrying: quota / free-tier-gate / budget exhaustion. ` +
       (detail ? `${detail}. ` : "") +
-      `Fix the plan, billing or balance issue (or wait out the reset window), then /retry. ` +
-      `Provider said: ${short}`
+      `Fix the plan, billing or balance issue (or wait out the reset window), then /retry.` +
+      forceHint + ` Provider said: ${short}`
     );
   }
   if (kind === "overflow") {
     return (
-      `Not retrying: context overflow. Run /compact first to shrink the context, then /retry. ` +
-      `Provider said: ${short}`
+      `Not retrying: context overflow. Run /compact first to shrink the context, then /retry.` +
+      forceHint + ` Provider said: ${short}`
     );
   }
   return (
-    `Not retrying: permanent failure (fix the underlying issue first, then /retry). ` +
-    `Provider said: ${short}`
+    `Not retrying: permanent failure (fix the underlying issue first, then /retry).` +
+    forceHint + ` Provider said: ${short}`
   );
 }
 
@@ -223,7 +252,25 @@ async function waitForNextRetry(
   return !_waitCancelled && _sessionGeneration === generation && ctx.isIdle();
 }
 
-/** Drop consecutive trailing error assistant messages from the live transcript. */
+/** Find the message a retry would resume from, past trailing error assistants. */
+function peekResumePoint(messages: AnyMessage[]): AnyMessage | undefined {
+  let idx = messages.length - 1;
+  while (idx >= 0) {
+    const msg = messages[idx];
+    if (msg.role === "assistant" && msg.stopReason === "error") {
+      idx--;
+      continue;
+    }
+    return msg;
+  }
+  return undefined;
+}
+
+/**
+ * Drop consecutive trailing error assistant messages from the live transcript.
+ * Call only on the path that actually continues — refusal paths must leave
+ * the transcript untouched.
+ */
 function stripTrailingErrors(messages: AnyMessage[]): number {
   let removed = 0;
   while (messages.length > 0) {
@@ -271,13 +318,32 @@ async function trueRetry(
   }
 }
 
+/** Send a prompt as a new user turn, queueing behind a just-started run on races. */
+function sendPrompt(pi: ExtensionAPI, ctx: ExtensionCommandContext, prompt: string): void {
+  try {
+    pi.sendUserMessage(prompt);
+  } catch (error) {
+    // Agent started streaming between the idle check and the send (e.g. a
+    // queued follow-up fired). Queue behind it instead of failing.
+    try {
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+    } catch {
+      notifySafe(
+        ctx,
+        `Could not send prompt: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  }
+}
+
 async function continuationSelect(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   if (!ctx.hasUI) {
     // Headless (print/json) mode cannot prompt — send the neutral default.
-    pi.sendUserMessage("Continue.");
+    sendPrompt(pi, ctx, "Continue.");
     return;
   }
   const choice = await ctx.ui.select("Select which prompt to send from this list.", [
@@ -297,21 +363,7 @@ async function continuationSelect(
     }
     prompt = custom.trim();
   }
-  try {
-    pi.sendUserMessage(prompt);
-  } catch (error) {
-    // Agent started streaming between the idle check and the send (e.g. a
-    // queued follow-up fired). Queue behind it instead of failing.
-    try {
-      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-    } catch {
-      notifySafe(
-        ctx,
-        `Could not send prompt: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    }
-  }
+  sendPrompt(pi, ctx, prompt);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,9 +452,18 @@ export default function (pi: ExtensionAPI) {
           }
         } else if (tail.role === "assistant") {
           report += "Finished assistant turn — /retry will offer continuation prompts.\n";
+        } else if (tail.role === "user" || tail.role === "toolResult") {
+          const branchErr = branchErrorTail(readBranchEntries(ctx));
+          report += branchErr
+            ? `Branch ends with error (${classifyWithPreset(activeProviderId(ctx), branchErr.errorMessage).kind}) — rules apply before continuing.\n`
+            : "Unanswered client turn — /retry will re-send it directly.\n";
         } else {
-          report += "Unanswered client turn — /retry will re-send it directly.\n";
+          report += `Trailing "${tail.role}" message — /retry cannot continue from it; send a new message instead.\n`;
         }
+        const editorPreview = readEditorText(ctx).trim().replace(/\s+/g, " ");
+        report += editorPreview
+          ? `Editor holds: "${editorPreview.length > 80 ? `${editorPreview.slice(0, 80)}…` : editorPreview}"\n`
+          : "Editor: empty\n";
         notifySafe(ctx, report, "info");
         return;
       }
@@ -498,30 +559,72 @@ export default function (pi: ExtensionAPI) {
           notifySafe(ctx, "Cannot retry: live transcript is unavailable.", "error");
           return;
         }
-        const removed = stripTrailingErrors(live);
-        void removed;
-        const resumeFrom = live[live.length - 1];
+        // Peek first: refusal paths must not mutate the transcript.
+        const resumeFrom = peekResumePoint(live);
         if (!resumeFrom || (resumeFrom.role !== "user" && resumeFrom.role !== "toolResult")) {
           notifySafe(
             ctx,
-            `Cannot re-send: transcript now ends with "${resumeFrom?.role ?? "nothing"}". Send a new message instead.`,
+            `Cannot re-send: transcript ends with "${resumeFrom?.role ?? "nothing"}" before the error(s). Send a new message instead.`,
             "warning",
           );
           return;
         }
+        stripTrailingErrors(live);
         const hint = lastUserText(live);
         await trueRetry(pi, ctx, hint ? `Retrying "${hint}"` : "Retrying last turn");
         return;
       }
 
-      // Case 2: unanswered client turn — just continue it.
+      // Case 2: the editor holds a request the transcript no longer contains.
+      // Tree navigation to a user message sets leaf=parent (the request drops
+      // out of the live transcript) and restores its text into the editor —
+      // without this, /retry would answer the *previous* turn instead of
+      // re-sending the navigated request.
+      const editorText = readEditorText(ctx);
+      const lastUser = lastUserText(messages);
+      if (isOrphanedEditorText(editorText, messages.some(m => m.role === "user") ? lastUser : undefined)) {
+        const branchErr = branchErrorTail(readBranchEntries(ctx));
+        if (branchErr) {
+          const verdict = classifyWithPreset(activeProviderId(ctx), branchErr.errorMessage);
+          if (!isRetryAllowed(verdict.kind)) {
+            notifySafe(
+              ctx,
+              describeRefusal(verdict.kind, branchErr.errorMessage ?? "Unknown error", verdict.detail),
+              "warning",
+            );
+            return;
+          }
+        }
+        const request = editorText.trim();
+        clearEditorText(ctx);
+        notifySafe(ctx, `Re-sending editor request "${textOf(request)}" (no prompt added to history)…`, "info");
+        sendPrompt(pi, ctx, request);
+        return;
+      }
+
+      // Case 3: unanswered client turn — just continue it. But first check
+      // the journal branch: if it ends with an error the live transcript no
+      // longer shows (compaction-stripped, or a mid-turn tree landing), the
+      // turn is not blindly continued — error rules apply instead.
       if (tail.role === "user" || tail.role === "toolResult") {
+        const branchErr = branchErrorTail(readBranchEntries(ctx));
+        if (branchErr) {
+          const verdict = classifyWithPreset(activeProviderId(ctx), branchErr.errorMessage);
+          if (!isRetryAllowed(verdict.kind)) {
+            notifySafe(
+              ctx,
+              describeRefusal(verdict.kind, branchErr.errorMessage ?? "Unknown error", verdict.detail),
+              "warning",
+            );
+            return;
+          }
+        }
         const hint = tail.role === "user" ? textOf(tail.content) : "unfinished tool turn";
         await trueRetry(pi, ctx, `Re-sending "${hint}"`);
         return;
       }
 
-      // Case 3: finished assistant turn (stop/length/aborted/...) — ask which
+      // Case 4: finished assistant turn (stop/length/aborted/...) — ask which
       // prompt to send. This is a continuation, not a retry, so the chosen
       // prompt IS sent as a new user message.
       if (tail.role === "assistant") {

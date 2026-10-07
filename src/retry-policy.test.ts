@@ -1,7 +1,9 @@
 import {
+  branchErrorTail,
   classifyError,
   classifyWithPreset,
   extractResetAt,
+  isOrphanedEditorText,
   parseRetryDelayMs,
   parseRetryAfterHeader,
   resolveWaitMs,
@@ -169,6 +171,48 @@ describe("classifyWithPreset (Z.AI)", () => {
     expect(classifyWithPreset("openrouter", ZAI_1308).kind).toBe("quota"); // generic still catches it
     expect(classifyWithPreset(undefined, ZAI_1308).kind).toBe("quota");
     expect(extractResetAt(ZAI_1308)).toBe("2026-10-06 21:10:01");
+  });
+});
+
+describe("branchErrorTail", () => {
+  it("finds a branch-tail error", () => {
+    const entries = [
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant", stopReason: "error", errorMessage: "503 boom" } },
+    ];
+    expect(branchErrorTail(entries)?.errorMessage).toBe("503 boom");
+  });
+
+  it("ignores errors superseded by newer messages", () => {
+    const entries = [
+      { type: "message", message: { role: "assistant", stopReason: "error", errorMessage: "503 boom" } },
+      { type: "message", message: { role: "user" } },
+    ];
+    expect(branchErrorTail(entries)).toBeUndefined();
+  });
+
+  it("returns undefined for successful assistant tails and empty branches", () => {
+    expect(
+      branchErrorTail([{ type: "message", message: { role: "assistant", stopReason: "stop" } }]),
+    ).toBeUndefined();
+    expect(branchErrorTail([])).toBeUndefined();
+  });
+
+  it("detects orphaned editor text (tree-nav restored requests)", () => {
+    expect(isOrphanedEditorText("", "hello")).toBe(false);
+    expect(isOrphanedEditorText("  hello  ", "hello")).toBe(false);
+    expect(isOrphanedEditorText("restored request", "older turn")).toBe(true);
+    expect(isOrphanedEditorText("anything", undefined)).toBe(true);
+  });
+});
+
+describe("opencode-go OpenAI-style rate limit (observed live)", () => {
+  it("treats rate_limit_exceeded as rate-limited with default wait", () => {
+    const msg =
+      'OpenAI API error (429): {"code":"rate_limit_exceeded","message":"Output token rate limit exceeded. Please retry after a brief wait."}';
+    expect(classifyError(msg)).toBe("rate-limited");
+    // "a brief wait" names no duration — nothing to parse, default wait applies.
+    expect(parseRetryDelayMs(msg)).toBeUndefined();
   });
 });
 

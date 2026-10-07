@@ -101,6 +101,23 @@ cp retry.ts ~/.pi/agent/extensions/pi-retry-action.ts
 /retry help       Show this help.
 ```
 
+## Session-tree navigation
+
+After `/tree` navigation the live transcript is rebuilt from the branch:
+
+- Navigated **to an error entry** (leaf = the error): `/retry` classifies that
+  error and retries / waits / refuses per the rules above.
+- Navigated **to a user message** (the failed request): pi sets leaf=parent
+  and restores the request text into the **editor** — the transcript no longer
+  contains it. `/retry` detects this orphaned editor text and re-sends *it*
+  as the retried turn (clearing the editor), instead of answering the
+  previous turn.
+- Landed **mid-turn** (e.g. on a `toolResult`) or after compaction stripped
+  the error: `/retry` checks the journal branch tail for an error first, so a
+  doomed turn is refused with guidance instead of blindly continued.
+
+All refusals end with: `To force continuation anyway, use '/retry continue'.`
+
 ## How the zero-message retry works
 
 Extensions are not handed the `Agent` instance, and the public API
