@@ -38,6 +38,10 @@ import {
   MAX_WAIT_MS,
   branchErrorTail,
   isOrphanedEditorText,
+  trailingErrors,
+  isIdenticalRepeat,
+  rewindToResumePoint,
+  isContinuableResumePoint,
   CONTINUATION_PROMPTS,
   CUSTOM_PROMPT_OPTION,
   type ErrorKind,
@@ -129,14 +133,6 @@ function readBranchEntries(ctx: ExtensionCommandContext): Array<unknown> {
     return ctx.sessionManager.getBranch() as Array<unknown>;
   } catch {
     return [];
-  }
-}
-
-function clearEditorText(ctx: ExtensionCommandContext): void {
-  try {
-    ctx.ui.setEditorText("");
-  } catch {
-    // Best-effort: headless modes have no editor.
   }
 }
 
@@ -252,48 +248,25 @@ async function waitForNextRetry(
   return !_waitCancelled && _sessionGeneration === generation && ctx.isIdle();
 }
 
-/** Find the message a retry would resume from, past trailing error assistants. */
-function peekResumePoint(messages: AnyMessage[]): AnyMessage | undefined {
-  let idx = messages.length - 1;
-  while (idx >= 0) {
-    const msg = messages[idx];
-    if (msg.role === "assistant" && msg.stopReason === "error") {
-      idx--;
-      continue;
-    }
-    return msg;
-  }
-  return undefined;
-}
-
-/**
- * Drop consecutive trailing error assistant messages from the live transcript.
- * Call only on the path that actually continues — refusal paths must leave
- * the transcript untouched.
- */
-function stripTrailingErrors(messages: AnyMessage[]): number {
-  let removed = 0;
-  while (messages.length > 0) {
-    const tail = messages[messages.length - 1];
-    if (tail.role === "assistant" && tail.stopReason === "error") {
-      messages.pop();
-      removed++;
-    } else {
-      break;
-    }
-  }
-  return removed;
-}
-
 // ---------------------------------------------------------------------------
 // Retry drivers
 // ---------------------------------------------------------------------------
 
-/** True retry as an action: no message is appended to the chat. */
+/**
+ * True retry as an action: no message is appended to the chat.
+ *
+ * Every outcome is reported — a retry must never go silent after announcing
+ * itself: success/failure surfaces through the normal transcript pipeline,
+ * a start failure notifies loudly, completion notifies briefly, and a slow
+ * provider gets a periodic status heartbeat while the run is pending.
+ */
 async function trueRetry(
   _pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   reason: string,
+  resumeRole: string,
+  liveCount: number,
+  note = "",
 ): Promise<void> {
   if (!_agent) {
     notifySafe(ctx, "Cannot retry: live agent is unavailable in this host. Send your message again manually.", "error");
@@ -303,17 +276,42 @@ async function trueRetry(
     notifySafe(ctx, "A retry is already in flight.", "warning");
     return;
   }
+  // Re-check right before continuing: another driver (native retry, a second
+  // extension, a queued turn) may have started since the handler's idle check.
+  // Continuing into an active run only throws "already processing".
+  if (!ctx.isIdle()) {
+    notifySafe(
+      ctx,
+      "Agent became busy before the retry started (another turn or retry began). Run /retry again once it settles.",
+      "warning",
+    );
+    return;
+  }
   _retryInFlight = true;
+  const generation = _sessionGeneration;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   try {
-    notifySafe(ctx, `${reason} — re-sending last turn (no prompt added)…`, "info");
-    await (_agent as unknown as { continue: () => Promise<void> }).continue();
+    notifySafe(
+      ctx,
+      `${reason} — re-sending last turn (no prompt added)… [${liveCount} msgs, from ${resumeRole}]${note}`,
+      "info",
+    );
+    const run = (_agent as unknown as { continue: () => Promise<void> }).continue();
+    heartbeat = setInterval(() => {
+      if (_sessionGeneration !== generation) return;
+      setStatusSafe(ctx, "retry in progress… (waiting for provider)");
+    }, 5000);
+    await run;
+    notifySafe(ctx, "Retry turn finished — see transcript.", "info");
   } catch (error) {
     notifySafe(
       ctx,
-      `Retry failed to start: ${error instanceof Error ? error.message : String(error)}`,
+      `Retry failed to start: ${error instanceof Error ? error.message : String(error)}. To send a fresh prompt instead, use '/retry continue'.`,
       "error",
     );
   } finally {
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    setStatusSafe(ctx, undefined);
     _retryInFlight = false;
   }
 }
@@ -560,8 +558,8 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         // Peek first: refusal paths must not mutate the transcript.
-        const resumeFrom = peekResumePoint(live);
-        if (!resumeFrom || (resumeFrom.role !== "user" && resumeFrom.role !== "toolResult")) {
+        const { resume: resumeFrom, rewindCount, rewoundToolCall } = rewindToResumePoint(live);
+        if (!isContinuableResumePoint(resumeFrom)) {
           notifySafe(
             ctx,
             `Cannot re-send: transcript ends with "${resumeFrom?.role ?? "nothing"}" before the error(s). Send a new message instead.`,
@@ -569,40 +567,23 @@ export default function (pi: ExtensionAPI) {
           );
           return;
         }
-        stripTrailingErrors(live);
+        const repeatNote = isIdenticalRepeat(trailingErrors(live))
+          ? " Previous attempt(s) failed identically — the resume point itself may be invalid (e.g. an orphaned tool result the provider rejects). Consider '/retry continue'."
+          : "";
+        const toolCallNote = rewoundToolCall
+          ? " Rewound a dangling tool call with no result — it will be re-issued."
+          : "";
+        // Rewind only on the path that actually continues: drop the trailing
+        // errors (and the dangling call, if any), then send context as-is.
+        // Nothing is appended — the completion arrives as the next turn(s).
+        live.splice(live.length - rewindCount, rewindCount);
         const hint = lastUserText(live);
-        await trueRetry(pi, ctx, hint ? `Retrying "${hint}"` : "Retrying last turn");
+        await trueRetry(pi, ctx, hint ? `Retrying "${hint}"` : "Retrying last turn", resumeFrom.role, live.length, `${toolCallNote}${repeatNote}`);
         return;
       }
 
-      // Case 2: the editor holds a request the transcript no longer contains.
-      // Tree navigation to a user message sets leaf=parent (the request drops
-      // out of the live transcript) and restores its text into the editor —
-      // without this, /retry would answer the *previous* turn instead of
-      // re-sending the navigated request.
-      const editorText = readEditorText(ctx);
-      const lastUser = lastUserText(messages);
-      if (isOrphanedEditorText(editorText, messages.some(m => m.role === "user") ? lastUser : undefined)) {
-        const branchErr = branchErrorTail(readBranchEntries(ctx));
-        if (branchErr) {
-          const verdict = classifyWithPreset(activeProviderId(ctx), branchErr.errorMessage);
-          if (!isRetryAllowed(verdict.kind)) {
-            notifySafe(
-              ctx,
-              describeRefusal(verdict.kind, branchErr.errorMessage ?? "Unknown error", verdict.detail),
-              "warning",
-            );
-            return;
-          }
-        }
-        const request = editorText.trim();
-        clearEditorText(ctx);
-        notifySafe(ctx, `Re-sending editor request "${textOf(request)}" (no prompt added to history)…`, "info");
-        sendPrompt(pi, ctx, request);
-        return;
-      }
-
-      // Case 3: unanswered client turn — just continue it. But first check
+      // Case 3: unanswered client turn — send context as-is, nothing new.
+      // But first check
       // the journal branch: if it ends with an error the live transcript no
       // longer shows (compaction-stripped, or a mid-turn tree landing), the
       // turn is not blindly continued — error rules apply instead.
@@ -620,14 +601,27 @@ export default function (pi: ExtensionAPI) {
           }
         }
         const hint = tail.role === "user" ? textOf(tail.content) : "unfinished tool turn";
-        await trueRetry(pi, ctx, `Re-sending "${hint}"`);
+        await trueRetry(pi, ctx, `Re-sending "${hint}"`, tail.role, messages.length);
         return;
       }
 
       // Case 4: finished assistant turn (stop/length/aborted/...) — ask which
       // prompt to send. This is a continuation, not a retry, so the chosen
-      // prompt IS sent as a new user message.
+      // prompt IS sent as a new user message (explicitly consented).
+      // A retry itself never creates messages — so when the editor holds an
+      // unsent request (e.g. restored there by tree navigation), it is left
+      // alone and pointed at instead of picker-overridden or auto-sent.
       if (tail.role === "assistant") {
+        const editorText = readEditorText(ctx);
+        const hasUser = messages.some(m => m.role === "user");
+        if (isOrphanedEditorText(editorText, hasUser ? lastUserText(messages) : undefined)) {
+          notifySafe(
+            ctx,
+            `Not retrying from the transcript: the editor holds an unsent request ("${textOf(editorText.trim())}"). Send it (Enter), clear it, or pick a continuation via '/retry continue'.`,
+            "warning",
+          );
+          return;
+        }
         await continuationSelect(pi, ctx);
         return;
       }

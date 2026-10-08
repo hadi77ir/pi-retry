@@ -101,6 +101,18 @@ cp retry.ts ~/.pi/agent/extensions/pi-retry-action.ts
 /retry help       Show this help.
 ```
 
+## Core principle: a retry never creates a message
+
+`/retry` sends the conversation context **as-is** and receives its completion
+as the next turn(s) — it never re-appends turns:
+
+- `toolResult` / `user` tail: continued directly, nothing new is added.
+- Error tail: the error is classified per the rules above; when retryable, the
+  transcript is rewound past trailing errors (plus one dangling tool call with
+  no result, which is then simply re-issued) and continued from there.
+- The only paths that send a *new* message are the ones you explicitly
+  consent to: picking a continuation prompt, or `/retry <text>`.
+
 ## Session-tree navigation
 
 After `/tree` navigation the live transcript is rebuilt from the branch:
@@ -108,15 +120,29 @@ After `/tree` navigation the live transcript is rebuilt from the branch:
 - Navigated **to an error entry** (leaf = the error): `/retry` classifies that
   error and retries / waits / refuses per the rules above.
 - Navigated **to a user message** (the failed request): pi sets leaf=parent
-  and restores the request text into the **editor** — the transcript no longer
-  contains it. `/retry` detects this orphaned editor text and re-sends *it*
-  as the retried turn (clearing the editor), instead of answering the
-  previous turn.
+  and restores the request text into the **editor**. Your draft is never
+  auto-sent — if `/retry` finds it there while the transcript shows a finished
+  turn, it tells you to send it (Enter), clear it, or pick `/retry continue`,
+  instead of answering the wrong turn.
 - Landed **mid-turn** (e.g. on a `toolResult`) or after compaction stripped
   the error: `/retry` checks the journal branch tail for an error first, so a
   doomed turn is refused with guidance instead of blindly continued.
 
 All refusals end with: `To force continuation anyway, use '/retry continue'.`
+
+## Retry observability
+
+A retry never goes silent after announcing itself:
+
+- Start line names the resume point (`[N msgs, from toolResult]`).
+- Completion notifies briefly (`Retry turn finished — see transcript`);
+  provider failures surface through the normal `Error: …` pipeline.
+- A slow provider gets a `retry in progress…` status heartbeat every 5s.
+- Start failures notify loudly with the reason.
+- If the trailing errors failed **identically** at least twice, the start
+  line warns that the resume point itself may be invalid (e.g. an orphaned
+  tool result the provider rejects no matter how often it is re-sent) and
+  suggests `/retry continue` — re-sending the same doomed turn is pointless.
 
 ## How the zero-message retry works
 

@@ -1,5 +1,9 @@
 import {
   branchErrorTail,
+  trailingErrors,
+  isIdenticalRepeat,
+  rewindToResumePoint,
+  isContinuableResumePoint,
   classifyError,
   classifyWithPreset,
   extractResetAt,
@@ -174,7 +178,66 @@ describe("classifyWithPreset (Z.AI)", () => {
   });
 });
 
-describe("branchErrorTail", () => {
+describe("branch and resume points", () => {
+  it("rewinds past trailing errors without mutating", () => {
+    const messages = [
+      { role: "user" },
+      { role: "assistant", stopReason: "error" },
+      { role: "assistant", stopReason: "error" },
+    ];
+    const result = rewindToResumePoint(messages);
+    expect(result.resume?.role).toBe("user");
+    expect(result.rewindCount).toBe(2);
+    expect(result.rewoundToolCall).toBe(false);
+    expect(isContinuableResumePoint(result.resume)).toBe(true);
+    expect(messages.length).toBe(3); // untouched
+  });
+
+  it("rewinds a trailing dangling tool call so it can be re-issued", () => {
+    const result = rewindToResumePoint([
+      { role: "user" },
+      { role: "assistant", stopReason: "toolUse" },
+    ]);
+    expect(result.resume?.role).toBe("user");
+    expect(result).toMatchObject({ rewindCount: 1, rewoundToolCall: true });
+  });
+
+  it("rewinds errors then a dangling call, but never completed turns", () => {
+    expect(
+      rewindToResumePoint([
+        { role: "user" },
+        { role: "assistant", stopReason: "toolUse" },
+        { role: "assistant", stopReason: "error" },
+      ]),
+    ).toMatchObject({ rewindCount: 2, rewoundToolCall: true });
+    expect(
+      rewindToResumePoint([{ role: "user" }, { role: "assistant", stopReason: "stop" }]).rewindCount,
+    ).toBe(0);
+    expect(
+      rewindToResumePoint([{ role: "user" }, { role: "toolResult" }]).rewindCount,
+    ).toBe(0);
+  });
+
+  it("rejects non-continuable resume points", () => {
+    expect(isContinuableResumePoint(undefined)).toBe(false);
+    expect(isContinuableResumePoint({ role: "assistant", stopReason: "stop" })).toBe(false);
+    expect(isContinuableResumePoint({ role: "custom" })).toBe(false);
+    expect(isContinuableResumePoint({ role: "toolResult" })).toBe(true);
+  });
+
+  it("detects identical repeats", () => {
+    const msgs = [
+      { role: "user" },
+      { role: "assistant", stopReason: "error", errorMessage: "Connection error." },
+      { role: "assistant", stopReason: "error", errorMessage: "Connection error." },
+    ];
+    expect(trailingErrors(msgs)).toEqual(["Connection error.", "Connection error."]);
+    expect(isIdenticalRepeat(trailingErrors(msgs))).toBe(true);
+    expect(isIdenticalRepeat(["a", "b"])).toBe(false);
+    expect(isIdenticalRepeat(["a"])).toBe(false);
+    expect(isIdenticalRepeat([])).toBe(false);
+  });
+
   it("finds a branch-tail error", () => {
     const entries = [
       { type: "message", message: { role: "user" } },

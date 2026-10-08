@@ -415,6 +415,84 @@ export function isOrphanedEditorText(editorText: string, lastUserText: string | 
   return current !== normalizePromptText(lastUserText);
 }
 
+/** Minimal live-transcript message shape for resume-point decisions. */
+export interface LiveMessage {
+  role?: string;
+  stopReason?: string;
+  errorMessage?: string;
+}
+
+/** Newest-last error texts of the consecutive trailing error run. */
+export function trailingErrors(messages: LiveMessage[]): string[] {
+  const out: string[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && msg.stopReason === "error") {
+      out.unshift(msg.errorMessage ?? "");
+    } else {
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * True when the trailing errors failed identically at least twice — resuming
+ * from the same point will likely fail the same way (e.g. the provider
+ * rejects an orphaned tool result no matter how often it is re-sent).
+ */
+export function isIdenticalRepeat(errors: string[]): boolean {
+  return errors.length >= 2 && errors.every(e => e === errors[0]);
+}
+
+export interface RewindResult {
+  /** Message a retry would resume from (send context as-is from here). */
+  resume: LiveMessage | undefined;
+  /** Trailing messages to drop to reach it. */
+  rewindCount: number;
+  /** True when the rewind also drops a dangling tool call. */
+  rewoundToolCall: boolean;
+}
+
+/**
+ * Rewind past what a retry must not send: trailing error assistants, plus a
+ * single trailing dangling tool call (an assistant toolUse with no toolResult
+ * after it — the provider would reject continuing past it, and the call can
+ * simply be re-issued from the resumed turn).
+ *
+ * Pure peek — never mutates, so refusal paths inspect freely. Completed
+ * turns (assistant text/toolResults, aborted tails) are never rewound.
+ */
+export function rewindToResumePoint(messages: LiveMessage[]): RewindResult {
+  let idx = messages.length - 1;
+  while (idx >= 0) {
+    const msg = messages[idx];
+    if (msg.role === "assistant" && msg.stopReason === "error") {
+      idx--;
+      continue;
+    }
+    break;
+  }
+  let rewoundToolCall = false;
+  const tail = idx >= 0 ? messages[idx] : undefined;
+  if (tail?.role === "assistant" && tail.stopReason === "toolUse") {
+    idx--;
+    rewoundToolCall = true;
+  }
+  return {
+    resume: idx >= 0 ? messages[idx] : undefined,
+    rewindCount: messages.length - 1 - idx,
+    rewoundToolCall,
+  };
+}
+
+/** True when agent.continue() can resume from this message. */
+export function isContinuableResumePoint(
+  msg: LiveMessage | undefined,
+): msg is LiveMessage & { role: "user" | "toolResult" } {
+  return !!msg && (msg.role === "user" || msg.role === "toolResult");
+}
+
 /** Continuation prompts offered when the last turn is a finished assistant message. */
 export const CONTINUATION_PROMPTS = [
   "Continue.",
