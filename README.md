@@ -165,6 +165,17 @@ npm test        # vitest — classification, delay parsing, wait decisions
 npm run typecheck
 ```
 
+## Troubleshooting
+
+- `Nothing to retry: the transcript is empty.` — the live transcript really
+  is empty (fresh session). Send a message first.
+- `The retry agent is not bound yet in this process …` — pi loaded the
+  extension after the session's agent was created (or a `/reload` wiped the
+  binding). The message includes a journal-based verdict for the branch tail.
+  Bind by starting any turn, or `/new` / `/resume` / restart pi, then `/retry`.
+- Two `/retry` commands (`/retry:1`, `/retry:2`): another retry extension is
+  installed. Remove the one you don't use.
+
 ---
 
 *This extension has been developed completely by "Muse Spark 1.3 Contributor on pi agent".*

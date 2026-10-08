@@ -1,6 +1,6 @@
 {
   "name": "pi-retry-action",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manual /retry for pi: re-sends the last client turn as a true action (no extra prompt added), offers selectable continuation prompts when the last turn is a finished assistant message, and honors upstream rate-limit rules including Retry-After and provider-specific delays (e.g. Z.AI).",
   "type": "module",
   "license": "MIT",

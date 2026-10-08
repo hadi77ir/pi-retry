@@ -60,22 +60,49 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _agent: Agent | null = null;
 
-try {
-  const proto = Agent.prototype as unknown as {
-    subscribe: (...args: unknown[]) => unknown;
-  };
-  const origSubscribe = proto.subscribe;
-  if (typeof origSubscribe === "function" && !(origSubscribe as { __piRetryPatched?: boolean }).__piRetryPatched) {
-    const patched = function (this: unknown, ...args: unknown[]) {
-      _agent = this as Agent;
-      return (origSubscribe as (...a: unknown[]) => unknown).apply(this, args);
+// Process-wide stash: module state is reset when pi reloads extensions, but
+// the prototype patches below live on the shared Agent class and keep firing.
+// Syncing through globalThis makes capture survive /reload in the same process.
+const _agentGlobal = globalThis as unknown as { __piRetryActionAgent?: Agent };
+
+function _bindAgent(instance: unknown): void {
+  _agent = instance as Agent;
+  try {
+    _agentGlobal.__piRetryActionAgent = instance as Agent;
+  } catch {
+    // Non-extensible globalThis in exotic hosts — module-local capture only.
+  }
+}
+
+function _patchAgentMethod<K extends "subscribe" | "prompt" | "continue">(name: K): void {
+  try {
+    const proto = Agent.prototype as unknown as Record<string, (...args: never[]) => unknown>;
+    const orig = proto[name];
+    if (typeof orig !== "function") return;
+    const flagged = orig as { __piRetryPatched?: boolean };
+    if (flagged.__piRetryPatched) return;
+    const patched = function (this: unknown, ...args: never[]) {
+      _bindAgent(this);
+      return (orig as (...a: never[]) => unknown).apply(this, args);
     };
     (patched as { __piRetryPatched?: boolean }).__piRetryPatched = true;
-    proto.subscribe = patched as (...args: unknown[]) => unknown;
+    proto[name] = patched;
+  } catch {
+    // If the Agent class cannot be patched (repackaged host, SDK mode),
+    // manual retry falls back to a clear diagnostic instead of failing silently.
   }
-} catch {
-  // If the Agent class cannot be patched (repackaged host, SDK mode), manual
-  // retry falls back to a clear diagnostic instead of failing silently.
+}
+
+// subscribe: binds on session construction (fresh + resume). prompt/continue:
+// bind on the first turn even when the extension loaded after the session's
+// Agent had already subscribed (capture would otherwise stay null forever).
+_patchAgentMethod("subscribe");
+_patchAgentMethod("prompt");
+_patchAgentMethod("continue");
+
+// Restore a capture made before a module reload in this process.
+if (!_agent && _agentGlobal.__piRetryActionAgent) {
+  _agent = _agentGlobal.__piRetryActionAgent;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +219,23 @@ function activeProviderId(ctx: ExtensionCommandContext): string | undefined {
   if (typeof model?.provider === "string" && model.provider) return model.provider;
   if (typeof model?.id === "string" && model.id.includes("/")) return model.id.split("/")[0];
   return undefined;
+}
+
+/**
+ * Explain an unbound live agent using what the journal CAN see, so the user
+ * gets a verdict instead of a dead end. Binds on the next turn/session
+ * (subscribe/prompt/continue patches + process-wide stash).
+ */
+function describeUnboundAgent(ctx: ExtensionCommandContext): string {
+  const branchErr = branchErrorTail(readBranchEntries(ctx));
+  const bindHint = "The retry agent is not bound yet in this process (extension loaded after the session started, or a /reload is pending a rebind). Start any turn — or /new, /resume, or restart pi — then run /retry again.";
+  if (!branchErr) return `${bindHint} The journal branch shows no trailing error to classify.`;
+  const err = branchErr.errorMessage ?? "Unknown error";
+  const { kind, detail } = classifyWithPreset(activeProviderId(ctx), err);
+  const verdict = isRetryAllowed(kind)
+    ? `Once bound, /retry would retry this (${kind}).`
+    : describeRefusal(kind, err, detail);
+  return `${bindHint} Journal branch ends with: ${err.slice(0, 160)} ${verdict}`;
 }
 
 function describeRefusal(kind: ErrorKind, errorMessage: string, detail?: string): string {
@@ -427,7 +471,13 @@ export default function (pi: ExtensionAPI) {
       if (/^status\b/i.test(sub)) {
         const messages = getLiveMessages();
         if (!messages || messages.length === 0) {
-          notifySafe(ctx, "Retry status: empty transcript — nothing to retry.", "info");
+          notifySafe(
+            ctx,
+            _agent
+              ? "Retry status: empty transcript — nothing to retry."
+              : `Retry status: live agent unbound. ${describeUnboundAgent(ctx)}`,
+            "info",
+          );
           return;
         }
         const tail = messages[messages.length - 1];
@@ -510,7 +560,14 @@ export default function (pi: ExtensionAPI) {
       const generation = _sessionGeneration;
       const messages = getLiveMessages();
       if (!messages || messages.length === 0) {
-        notifySafe(ctx, "Nothing to retry: the transcript is empty.", "warning");
+        // Distinguish a genuinely empty transcript from a capture gap: the
+        // journal may hold history the live agent handle cannot see yet
+        // (extension loaded after session start, post-/reload before rebind).
+        if (!_agent) {
+          notifySafe(ctx, describeUnboundAgent(ctx), "warning");
+        } else {
+          notifySafe(ctx, "Nothing to retry: the transcript is empty.", "warning");
+        }
         return;
       }
 
