@@ -25,6 +25,7 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { matchesKey } from "@earendil-works/pi-tui";
 
@@ -103,6 +104,148 @@ _patchAgentMethod("continue");
 // Restore a capture made before a module reload in this process.
 if (!_agent && _agentGlobal.__piRetryActionAgent) {
   _agent = _agentGlobal.__piRetryActionAgent;
+}
+
+// ---------------------------------------------------------------------------
+// Session awareness for out-of-band runs
+// ---------------------------------------------------------------------------
+//
+// A manual retry drives agent.continue() directly, bypassing
+// AgentSession._runAgentPrompt — the only place that sets _isAgentRunActive.
+// Without correction the session reports idle for the whole retried turn:
+// Escape never aborts (TUI gates abort on session.isStreaming), typed input
+// takes the non-streaming path and explodes on "already processing", and
+// agent_settled never fires. The corrections below make session state truthful
+// for ANY run (native behavior is preserved bit-for-bit) and settle cleanly
+// after ours. Everything is guarded: if pi's internals change shape, the
+// extension falls back to today's behavior instead of breaking startup.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _session: any | null = null;
+const _sessionGlobal = globalThis as unknown as { __piRetryActionSession?: unknown };
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function _bindSession(instance: any): void {
+  _session = instance;
+  try {
+    _sessionGlobal.__piRetryActionSession = instance;
+  } catch {
+    // Non-extensible globalThis in exotic hosts — module-local capture only.
+  }
+}
+
+function _patchSessionPrototype(): void {
+  try {
+    const proto = AgentSession.prototype as unknown as Record<string, unknown>;
+    if (!proto || typeof proto["waitForIdle"] !== "function") return;
+    if ((proto as { __piRetryActionPatched?: boolean }).__piRetryActionPatched) return;
+    (proto as { __piRetryActionPatched?: boolean }).__piRetryActionPatched = true;
+
+    // Capture the session on every event flow (earliest possible binding).
+    const origEmitExt = proto["_emitExtensionEvent"];
+    if (typeof origEmitExt === "function") {
+      const fn = origEmitExt as (...args: unknown[]) => unknown;
+      proto["_emitExtensionEvent"] = async function (this: unknown, ...args: unknown[]) {
+        _bindSession(this);
+        return fn.apply(this, args);
+      };
+    }
+
+    // Truthful streaming state: the agent-level flag covers out-of-band runs
+    // driven outside _runAgentPrompt. For native runs both flags coincide.
+    const sessionProto = proto as Record<string, unknown>;
+    Object.defineProperty(sessionProto, "isStreaming", {
+      configurable: true,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      get(this: any) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const self = this as any;
+          if (self._isAgentRunActive) return true;
+          return self.agent?.state?.isStreaming === true;
+        } catch {
+          return false;
+        }
+      },
+    });
+    Object.defineProperty(sessionProto, "isIdle", {
+      configurable: true,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      get(this: any) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return !(this as any).isStreaming;
+        } catch {
+          return true;
+        }
+      },
+    });
+
+    // waitForIdle that also works across out-of-band runs: the session-level
+    // idle promise is only resolved by _emitAgentSettled (native runs), so an
+    // out-of-band run would hang it — wait on the agent directly instead.
+    const origWait = proto["waitForIdle"];
+    if (typeof origWait === "function") {
+      const fn = origWait as (...args: unknown[]) => unknown;
+      proto["waitForIdle"] = async function (this: unknown, ...args: unknown[]) {
+        _bindSession(this);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const self = this as any;
+        try {
+          if (self.isIdle) return;
+        } catch {
+          return fn.apply(this, args);
+        }
+        if (!self._isAgentRunActive) {
+          try {
+            if (typeof self.agent?.waitForIdle === "function") {
+              await self.agent.waitForIdle();
+              return;
+            }
+          } catch {
+            return;
+          }
+        }
+        return fn.apply(this, args);
+      };
+    }
+  } catch {
+    // Private-surface surgery failed (host repackaged pi internals): cancel
+    // and steering during manual retries stay degraded, nothing else breaks.
+  }
+}
+
+_patchSessionPrototype();
+
+if (!_session && _sessionGlobal.__piRetryActionSession) {
+  _session = _sessionGlobal.__piRetryActionSession;
+}
+
+/**
+ * Emit settlement for our out-of-band run so TUI indicators clean up and
+ * session-level waiters resolve. Strictly guarded: never fires while a native
+ * run owns settlement or while the agent is still running.
+ */
+function _settleSessionIfOurs(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const s = _session as any;
+    if (!s || typeof s._emitAgentSettled !== "function") return;
+    if (s._isAgentRunActive) return;
+    try {
+      const streaming = (_agent as unknown as { state?: { isStreaming?: boolean } } | null)
+        ?.state?.isStreaming === true;
+      if (streaming) return;
+    } catch {
+      return;
+    }
+    const result = s._emitAgentSettled() as unknown;
+    if (result && typeof (result as Promise<void>).catch === "function") {
+      (result as Promise<void>).catch(() => {});
+    }
+  } catch {
+    // Best effort only.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +500,9 @@ async function trueRetry(
     if (heartbeat !== undefined) clearInterval(heartbeat);
     setStatusSafe(ctx, undefined);
     _retryInFlight = false;
+    // Our run bypassed _runAgentPrompt, so nothing else emits settlement:
+    // without this, TUI indicators and session waiters hang past our turn.
+    _settleSessionIfOurs();
   }
 }
 

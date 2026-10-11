@@ -144,6 +144,22 @@ A retry never goes silent after announcing itself:
   tool result the provider rejects no matter how often it is re-sent) and
   suggests `/retry continue` — re-sending the same doomed turn is pointless.
 
+## Session awareness (cancel / steering during retries)
+
+A manual retry drives `agent.continue()` directly, bypassing
+`AgentSession._runAgentPrompt` — the only place that marks the session as
+streaming. The extension compensates with guarded, behavior-preserving
+surgery on pi internals (all skipped silently if their shape changes):
+
+- `isStreaming` / `isIdle` report the agent-level run flag too, so Escape
+  aborts a retried turn and typed input queues as steer/follow-up exactly
+  like in native turns (native runs are unaffected — both flags coincide).
+- `waitForIdle` also resolves across out-of-band runs by waiting on the agent
+  directly (the session-level idle promise is never resolved for them).
+- After the retried turn, settlement (`agent_settled`) is emitted so TUI
+  indicators clean up and session waiters resolve — strictly skipped while a
+  native run owns settlement or the agent is still running.
+
 ## How the zero-message retry works
 
 Extensions are not handed the `Agent` instance, and the public API
